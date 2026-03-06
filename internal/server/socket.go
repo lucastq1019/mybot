@@ -9,7 +9,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 
 	"mybot/internal/brain"
 	"mybot/internal/config"
@@ -251,21 +250,8 @@ func (ss *SocketServer) handleDigest(args []string) Response {
 	// 调用 LLM 生成摘要（如果有 LLM 集成）
 	var llmSummary string
 	if config.Config != nil && config.Config.LLM.Enabled || llm.IsAvailable() {
-		var llmClient *llm.Client
-		var err error
-		// 优先使用配置
-		if config.Config != nil && config.Config.LLM.Enabled {
-			llmClient, err = llm.NewClientFromConfig(
-				config.Config.LLM.Provider,
-				config.Config.LLM.APIKey,
-				config.Config.LLM.APIURL,
-				config.Config.LLM.Model,
-				config.Config.LLM.MaxTokens,
-				time.Duration(config.Config.LLM.Timeout)*time.Second,
-			)
-		} else {
-			llmClient, err = llm.NewClient()
-		}
+		// 使用按角色配置的摘要模型
+		llmClient, err := llm.NewClientForRole(llm.RoleSummarize)
 		if err == nil {
 			instructions := fmt.Sprintf(
 				"你是一个专业的记忆摘要助手。请为以下内容生成一个简洁、结构化的摘要。" +

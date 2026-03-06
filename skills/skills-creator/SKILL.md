@@ -16,7 +16,7 @@ dependencies: []
 
 ## 规范
 
-### Frontmatter（必需）
+### Frontmatter
 
 与 skill-validator 一致，新建技能须包含：
 
@@ -54,10 +54,6 @@ dependencies: []
 
 命名：仅小写与连字符，如 `code-generator`、`document-parser`。
 
-### 版本
-
-语义化版本 MAJOR.MINOR.PATCH：不兼容改 MAJOR，兼容新增 MINOR，兼容修正 PATCH。
-
 ## 创建流程
 
 按序执行并勾选：
@@ -70,7 +66,3 @@ dependencies: []
 ```
 
 **步骤 4 约定**：在 `skills` 中追加一项（含 name、path、description、version、author、tags、dependencies）；在 `tags_index` 中为每个 tag 在对应数组中追加本技能 `name`（若 key 不存在则新建数组）。
-
-## 收尾
-
-- 创建完成后，若为本次任务的一部分，按 brain/core.md 执行**任务后记忆迭代**。

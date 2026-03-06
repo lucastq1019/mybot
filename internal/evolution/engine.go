@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	"mybot/internal/config"
 	"mybot/internal/llm"
 	"mybot/internal/memory"
 	"mybot/internal/scheduler"
@@ -33,28 +32,10 @@ type AutonomousEvolutionEngine struct {
 // NewAutonomousEvolutionEngine 创建自主演进引擎
 // registry / skillsIndex 用于将真正可执行的技能以 tools 形式暴露给 LLM。
 func NewAutonomousEvolutionEngine(memMgr *memory.MemoryManager, registry *scheduler.SkillRegistry, skillsIndex *scheduler.SkillsIndexLoader) (*AutonomousEvolutionEngine, error) {
-	var llmClient *llm.Client
-	// 尝试从配置创建 LLM 客户端
-	if config.Config != nil && config.Config.LLM.Enabled {
-		var err error
-		llmClient, err = llm.NewClientFromConfig(
-			config.Config.LLM.Provider,
-			config.Config.LLM.APIKey,
-			config.Config.LLM.APIURL,
-			config.Config.LLM.Model,
-			config.Config.LLM.MaxTokens,
-			time.Duration(config.Config.LLM.Timeout)*time.Second,
-		)
-		if err != nil {
-			log.Printf("Warning: failed to create LLM client from config: %v", err)
-		}
-	} else if llm.IsAvailable() {
-		// 回退到环境变量
-		var err error
-		llmClient, err = llm.NewClient()
-		if err != nil {
-			log.Printf("Warning: failed to create LLM client: %v", err)
-		}
+	// 按“自主演进”角色创建 LLM 客户端
+	llmClient, err := llm.NewClientForRole(llm.RoleEvolution)
+	if err != nil {
+		log.Printf("Warning: failed to create LLM client for evolution role: %v", err)
 	}
 
 	// 在自主演进引擎中，LLM 是硬依赖，缺失时直接 panic，避免静默退化。

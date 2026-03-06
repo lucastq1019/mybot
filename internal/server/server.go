@@ -132,24 +132,19 @@ func (s *Server) setupSignalHandling() {
 func (s *Server) Stop() {
 	log.Println("Initiating graceful shutdown...")
 
-	// 停止接受新任务（Drain）
 	s.cancel()
 
-	// 停止自主演进引擎
 	if s.evolution != nil {
 		s.evolution.SetEnabled(false)
 		log.Println("Evolution engine stopped")
 	}
 
-	// 停止 socket 服务器
 	if s.socketSrv != nil {
 		s.socketSrv.Stop()
 	}
 
-	// 停止调度器
 	s.sched.Stop()
 
-	// 等待当前任务完成（简单实现，实际可以更复杂）
 	time.Sleep(100 * time.Millisecond)
 
 	log.Println("Server stopped gracefully")

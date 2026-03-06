@@ -176,22 +176,8 @@ func (m *MemoryManager) RecallWithPreprocess(query string, topK int, useLLM bool
 	var processedQuery string
 
 	if useLLM && (config.Config != nil && config.Config.LLM.Enabled || llm.IsAvailable()) {
-		// 使用 LLM 预处理
-		var llmClient *llm.Client
-		var err error
-		// 优先使用配置
-		if config.Config != nil && config.Config.LLM.Enabled {
-			llmClient, err = llm.NewClientFromConfig(
-				config.Config.LLM.Provider,
-				config.Config.LLM.APIKey,
-				config.Config.LLM.APIURL,
-				config.Config.LLM.Model,
-				config.Config.LLM.MaxTokens,
-				time.Duration(config.Config.LLM.Timeout)*time.Second,
-			)
-		} else {
-			llmClient, err = llm.NewClient()
-		}
+		// 使用 LLM 预处理（按角色使用索引模型）
+		llmClient, err := llm.NewClientForRole(llm.RoleIndex)
 		if err == nil {
 			result, err := llmClient.PreprocessQuery(query)
 			if err == nil {
@@ -633,86 +619,8 @@ func (m *MemoryManager) GetIndex() *MemoryIndex {
 
 // createLLMClient 创建 LLM 客户端（从配置读取）
 func (m *MemoryManager) createLLMClient() (*llm.Client, error) {
-	var provider, apiKey, apiURL, model string
-	var maxTokens int
-	var timeout time.Duration
-
-	// 优先从全局配置读取（配置文件中的值优先）
-	if config.Config != nil {
-		provider = config.Config.LLM.Provider
-		apiKey = config.Config.LLM.APIKey
-		apiURL = config.Config.LLM.APIURL  // 使用配置文件中的 URL
-		model = config.Config.LLM.Model
-		maxTokens = config.Config.LLM.MaxTokens
-		timeout = time.Duration(config.Config.LLM.Timeout) * time.Second
-		
-		// 记录使用的配置来源（用于调试）
-		if apiURL != "" {
-			log.Printf("Using API URL from config file: %s", apiURL)
-		}
-	}
-
-	// 如果配置中的 APIKey 为空，从环境变量读取
-	if apiKey == "" {
-		// 先根据 provider 确定从哪个环境变量读取
-		if provider == "" || provider == "qwen" || provider == "tongyi" || provider == "dashscope" {
-			apiKey = os.Getenv("DASHSCOPE_API_KEY")
-			if apiKey != "" && provider == "" {
-				provider = "qwen"
-			}
-		}
-		if apiKey == "" && (provider == "" || provider == "claude" || provider == "anthropic") {
-			apiKey = os.Getenv("ANTHROPIC_API_KEY")
-			if apiKey != "" && provider == "" {
-				provider = "claude"
-			}
-		}
-		if apiKey == "" {
-			apiKey = os.Getenv("OPENAI_API_KEY")
-			if apiKey != "" && provider == "" {
-				provider = "openai"
-			}
-		}
-	}
-
-	// 如果 provider 仍为空，根据环境变量自动检测
-	if provider == "" {
-		if os.Getenv("DASHSCOPE_API_KEY") != "" {
-			provider = "qwen"
-		} else if os.Getenv("ANTHROPIC_API_KEY") != "" {
-			provider = "claude"
-		} else {
-			provider = "openai"
-		}
-	}
-
-	// 如果 apiURL 为空，根据 provider 设置默认值
-	if apiURL == "" {
-		switch provider {
-		case "qwen", "tongyi", "dashscope":
-			// 使用 OpenAI 兼容模式（推荐）
-			apiURL = "https://dashscope.aliyuncs.com/compatible-mode/v1/chat/completions"
-		case "claude", "anthropic":
-			apiURL = "https://api.anthropic.com/v1/messages"
-		default:
-			apiURL = "https://api.openai.com/v1/chat/completions"
-		}
-	}
-
-	// 如果 model 为空，根据 provider 设置默认值
-	if model == "" {
-		switch provider {
-		case "qwen", "tongyi", "dashscope":
-			model = "qwen-turbo"
-		case "claude", "anthropic":
-			model = "claude-3-sonnet-20240229"
-		default:
-			model = "gpt-3.5-turbo"
-		}
-	}
-
-	// 使用配置创建客户端（NewClientFromConfig 会处理空值）
-	return llm.NewClientFromConfig(provider, apiKey, apiURL, model, maxTokens, timeout)
+	// 使用角色化工厂函数创建，用于记忆压缩/长文摘要等场景
+	return llm.NewClientForRole(llm.RoleCompress)
 }
 
 // CheckSummarizeTrigger 检查是否应该触发摘要

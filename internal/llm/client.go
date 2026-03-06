@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"mybot/internal/brain"
+	"mybot/internal/config"
 )
 
 const (
@@ -36,6 +37,18 @@ type Client struct {
 	httpClient *http.Client
 	provider   Provider
 }
+
+// Role 表示 LLM 使用角色（不同用途可绑定不同模型）
+type Role string
+
+const (
+	RoleDefault   Role = "default"
+	RoleChat      Role = "chat"
+	RoleSummarize Role = "summarize"
+	RoleIndex     Role = "index"
+	RoleCompress  Role = "compress"
+	RoleEvolution Role = "evolution"
+)
 
 var (
 	bootLeaderOnce   sync.Once
@@ -72,6 +85,47 @@ func withBootLeaderSystemMessage(messages []Message) []Message {
 	out = append(out, Message{Role: "system", Content: prompt})
 	out = append(out, messages...)
 	return out
+}
+
+// resolveModelForRole 根据全局配置与角色解析应使用的模型名称。
+// 优先级：cfg.Models[role] -> cfg.Models["default"] -> cfg.Model -> 由 NewClientFromConfig 内部根据环境变量与 Provider 决定。
+func resolveModelForRole(cfg config.LLMConfig, role Role) string {
+	if cfg.Models != nil {
+		if model, ok := cfg.Models[string(role)]; ok && strings.TrimSpace(model) != "" {
+			return strings.TrimSpace(model)
+		}
+		if model, ok := cfg.Models[string(RoleDefault)]; ok && strings.TrimSpace(model) != "" {
+			return strings.TrimSpace(model)
+		}
+	}
+
+	if strings.TrimSpace(cfg.Model) != "" {
+		return strings.TrimSpace(cfg.Model)
+	}
+
+	// 为空时交由 NewClientFromConfig 使用环境变量与 Provider 默认值决定
+	return ""
+}
+
+// NewClientForRole 使用全局配置和角色创建 LLM 客户端。
+// - 当配置文件启用 LLM 时，从 config.Config.LLM 读取 Provider/APIURL/APIKey/MaxTokens/Timeout，并按角色解析模型名。
+// - 当配置未启用或尚未加载时，回退到 NewClient（环境变量与默认策略）。
+func NewClientForRole(role Role) (*Client, error) {
+	if config.Config != nil && config.Config.LLM.Enabled {
+		llmCfg := config.Config.LLM
+		model := resolveModelForRole(llmCfg, role)
+		return NewClientFromConfig(
+			llmCfg.Provider,
+			llmCfg.APIKey,
+			llmCfg.APIURL,
+			model,
+			llmCfg.MaxTokens,
+			time.Duration(llmCfg.Timeout)*time.Second,
+		)
+	}
+
+	// 配置未启用或未加载，沿用现有环境变量与默认逻辑
+	return NewClient()
 }
 
 // NewClient 创建新的 LLM 客户端（从环境变量或配置读取）

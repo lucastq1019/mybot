@@ -60,6 +60,8 @@ type LLMConfig struct {
 	APIURL string `json:"api_url"`
 	// Model 模型名称
 	Model string `json:"model"`
+	// Models 按角色配置的模型名称映射（如 default/compress/index/summarize/evolution）
+	Models map[string]string `json:"models"`
 	// MaxTokens 最大 token 数
 	MaxTokens int `json:"max_tokens"`
 	// Timeout 超时时间（秒）
