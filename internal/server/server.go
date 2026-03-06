@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"mybot/internal/brain"
+	"mybot/internal/config"
 	"mybot/internal/evolution"
 	"mybot/internal/memory"
 	"mybot/internal/scheduler"
@@ -18,14 +19,14 @@ import (
 // Server 常驻进程服务器。路径与技能索引与 brain/core.md 一致（见 internal/brain/paths.go）。
 // 可执行技能为 .so 插件与内置技能；MD 技能通过 socket 的 skill_get 提供 SKILL.md 内容，由 Agent 按 core 规则执行，避免 brain 与代码分歧导致无效演进。
 type Server struct {
-	memMgr       *memory.MemoryManager
-	sched        *scheduler.Scheduler
-	registry     *scheduler.SkillRegistry
-	skillsIndex  *scheduler.SkillsIndexLoader
-	socketSrv    *SocketServer
-	evolution    *evolution.AutonomousEvolutionEngine
-	ctx          context.Context
-	cancel       context.CancelFunc
+	memMgr      *memory.MemoryManager
+	sched       *scheduler.Scheduler
+	registry    *scheduler.SkillRegistry
+	skillsIndex *scheduler.SkillsIndexLoader
+	socketSrv   *SocketServer
+	evolution   *evolution.AutonomousEvolutionEngine
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // NewServer 创建新的服务器实例
@@ -60,6 +61,22 @@ func NewServer() (*Server, error) {
 // Start 启动服务器（启动流程完整链路）
 func (s *Server) Start() error {
 	log.Println("Starting Cata server...")
+
+	if err := s.startCorePipeline(); err != nil {
+		s.shutdownPartialStart()
+		return err
+	}
+
+	// 6. 设置信号处理（优雅退出）
+	s.setupSignalHandling()
+
+	log.Println("Cata server started successfully!")
+	return nil
+}
+
+// startCorePipeline 运行服务启动的核心流程。
+// 该流程按「记忆 -> 技能 -> 调度 -> 通信 -> 演进」顺序启动，任何关键阶段失败都会中断启动。
+func (s *Server) startCorePipeline() error {
 
 	// 1. MemoryManager 已在 NewServer 中创建并加载索引
 	log.Println("✓ MemoryManager initialized")
@@ -99,7 +116,12 @@ func (s *Server) Start() error {
 	socketSrv.Start()
 	log.Println("✓ Socket server started")
 
-	// 5. 初始化并启动自主演进引擎
+	// 5. 初始化并启动自主演进引擎（可通过配置开关禁用）
+	if config.Config != nil && !config.Config.Evolution.Enabled {
+		log.Println("- Evolution engine disabled by configuration")
+		return nil
+	}
+
 	evolutionEngine, err := evolution.NewAutonomousEvolutionEngine(s.memMgr, s.registry, s.skillsIndex)
 	if err != nil {
 		log.Printf("Warning: failed to create evolution engine: %v", err)
@@ -109,11 +131,24 @@ func (s *Server) Start() error {
 		log.Println("✓ Autonomous evolution engine started")
 	}
 
-	// 6. 设置信号处理（优雅退出）
-	s.setupSignalHandling()
-
-	log.Println("Cata server started successfully!")
 	return nil
+}
+
+// shutdownPartialStart 在启动流程中途失败时清理已启动的组件，避免遗留后台任务。
+func (s *Server) shutdownPartialStart() {
+	if s.evolution != nil {
+		s.evolution.SetEnabled(false)
+		s.evolution = nil
+	}
+
+	if s.socketSrv != nil {
+		s.socketSrv.Stop()
+		s.socketSrv = nil
+	}
+
+	if s.sched != nil {
+		s.sched.Stop()
+	}
 }
 
 // setupSignalHandling 设置信号处理（SIGTERM, SIGINT）
@@ -188,12 +223,12 @@ func (s *Server) loadBuiltinSkills() error {
 	if err := s.registry.Register(dailySkill); err != nil {
 		return fmt.Errorf("failed to register daily consolidate skill: %w", err)
 	}
-	
+
 	// 注册周期摘要技能
 	summarizeSkill := scheduler.NewPeriodicSummarizeSkill(s.memMgr)
 	if err := s.registry.Register(summarizeSkill); err != nil {
 		return fmt.Errorf("failed to register periodic summarize skill: %w", err)
 	}
-	
+
 	return nil
 }
