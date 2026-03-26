@@ -86,6 +86,12 @@ type EvolutionConfig struct {
 	CycleInterval int `json:"cycle_interval"`
 	// TaskQueueInterval 任务队列检查间隔（秒）
 	TaskQueueInterval int `json:"task_queue_interval"`
+	// FallbackLowSuccessRate 回退策略中“低成功率”阈值（0-1）
+	FallbackLowSuccessRate float64 `json:"fallback_low_success_rate"`
+	// FallbackMinRecentTasks 触发低成功率判断所需的最少近期任务数
+	FallbackMinRecentTasks int `json:"fallback_min_recent_tasks"`
+	// FallbackPendingTasksThreshold 回退策略中 pending tasks 的触发阈值
+	FallbackPendingTasksThreshold int `json:"fallback_pending_tasks_threshold"`
 }
 
 // LoadConfig 加载配置文件
@@ -188,9 +194,12 @@ func getDefaultConfig() *AppConfig {
 			LogLevel:   "info",
 		},
 		Evolution: EvolutionConfig{
-			Enabled:            true,
-			CycleInterval:      3600, // 1 小时
-			TaskQueueInterval: 30,   // 30 秒
+			Enabled:                       true,
+			CycleInterval:                 3600, // 1 小时
+			TaskQueueInterval:             30,   // 30 秒
+			FallbackLowSuccessRate:        0.5,
+			FallbackMinRecentTasks:        3,
+			FallbackPendingTasksThreshold: 1,
 		},
 	}
 }
@@ -315,6 +324,17 @@ func validateAndSetDefaults(config *AppConfig) error {
 	// 如果环境变量有 API key，自动启用 LLM（即使配置文件中 enabled 为 false）
 	if config.LLM.APIKey != "" {
 		config.LLM.Enabled = true
+	}
+
+	// Evolution 回退策略默认值与边界修正
+	if config.Evolution.FallbackLowSuccessRate <= 0 || config.Evolution.FallbackLowSuccessRate >= 1 {
+		config.Evolution.FallbackLowSuccessRate = 0.5
+	}
+	if config.Evolution.FallbackMinRecentTasks <= 0 {
+		config.Evolution.FallbackMinRecentTasks = 3
+	}
+	if config.Evolution.FallbackPendingTasksThreshold <= 0 {
+		config.Evolution.FallbackPendingTasksThreshold = 1
 	}
 
 	return nil

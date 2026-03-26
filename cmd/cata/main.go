@@ -97,7 +97,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println("Cata - 自主进化记忆与任务服务（实现 brain/core.md 与 brain/workflow.md 流程）")
+	fmt.Println("Cata - 核心记忆服务（精简实现）")
 	fmt.Println()
 	fmt.Println("Usage: cata <command> [options]")
 	fmt.Println()
@@ -116,10 +116,11 @@ func printUsage() {
 	fmt.Println("  cata stop              # Stop running server")
 	fmt.Println()
 	fmt.Println("Client (catacli):")
-	fmt.Println("  Use 'catacli' only to publish tasks and view results (rest is decided by server LLM):")
-	fmt.Println("  catacli task create \"<需求描述>\" [--async]")
-	fmt.Println("  catacli task list")
-	fmt.Println("  catacli task status <task-id>")
+	fmt.Println("  catacli recall \"query\" [topK] [--llm]")
+	fmt.Println("  catacli digest [query] [--since 7d]")
+	fmt.Println("  catacli consolidate \"topic\" \"content\"")
+	fmt.Println("  catacli evolve <status|history|once>")
+	fmt.Println("  catacli task <create|list|status> ...")
 	fmt.Println("  catacli ping")
 	fmt.Println()
 	fmt.Println("For more information, see README.md")

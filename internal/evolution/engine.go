@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"mybot/internal/config"
 	"mybot/internal/llm"
 	"mybot/internal/memory"
 	"mybot/internal/scheduler"
@@ -27,6 +28,32 @@ type AutonomousEvolutionEngine struct {
 	decisionHistory []llm.Message
 	enabled       bool
 	cycleInterval time.Duration
+}
+
+const (
+	reactMaxSteps = 6
+	defaultFallbackLowSuccessRate        = 0.5
+	defaultFallbackMinRecentTasks        = 3
+	defaultFallbackPendingTasksThreshold = 1
+)
+
+type fallbackPolicy struct {
+	lowSuccessRate        float64
+	minRecentTasks        int
+	pendingTasksThreshold int
+}
+
+type reactAssistantEnvelope struct {
+	Type       string      `json:"type"` // "tool_calls" | "final"
+	Final      *ActionPlan `json:"final,omitempty"`
+	Reasoning  string      `json:"reasoning,omitempty"`
+}
+
+type reactToolResult struct {
+	ToolCallID string `json:"tool_call_id"`
+	ToolName   string `json:"tool_name"`
+	Success    bool   `json:"success"`
+	Observation string `json:"observation"`
 }
 
 // NewAutonomousEvolutionEngine 创建自主演进引擎
@@ -156,44 +183,68 @@ func (e *AutonomousEvolutionEngine) DecideNextAction(ctx context.Context, state 
 		panic("DecideNextAction: LLM client is nil")
 	}
 
-	// 构建决策 Prompt
+	// 构建决策 Prompt（作为 ReAct 内层循环的初始 user 消息）
 	prompt := e.buildDecisionPrompt(state)
-
-	// 为决策阶段构造可执行技能对应的 tools，让 LLM 知道有哪些 server-side 能力可调度。
 	tools := e.buildDecisionTools()
-
-	// 构造带上下文的消息：先带上历史对话（若有），再加本轮决策的 system+user。
-	messages := make([]llm.Message, 0, len(e.decisionHistory)+2)
+	messages := make([]llm.Message, 0, len(e.decisionHistory)+reactMaxSteps*2+2)
 	messages = append(messages, e.decisionHistory...)
-	currentUser := llm.Message{Role: "user", Content: prompt}
+	currentUser := llm.Message{
+		Role: "user",
+		Content: prompt + "\n\n严格按 ReAct 内层循环执行：每一步只能做两件事之一：\n" +
+			"1) 调用工具（tool_calls）\n" +
+			"2) 结束并返回 final ActionPlan。\n" +
+			"如果要结束，必须输出 JSON: {\"type\":\"final\",\"final\":{...ActionPlan...}}。",
+	}
 	messages = append(messages,
-		llm.Message{Role: "system", Content: "你是一个自主演进的记忆系统。请分析当前状态，决定下一步应该执行什么行动。返回 JSON 格式的 ActionPlan。"},
+		llm.Message{
+			Role: "system",
+			Content: "你是一个自主演进的记忆系统，必须严格遵循 ReAct。每轮只能选择：tool_calls 或 final。\n" +
+				"协议：\n" +
+				"- 若发起工具调用：可返回 {\"type\":\"tool_calls\",\"reasoning\":\"...\"} 并附带 tool calls。\n" +
+				"- 若结束：必须返回 {\"type\":\"final\",\"final\":{\"action\":\"...\",\"reason\":\"...\",\"steps\":[],\"expected_outcome\":\"...\",\"priority\":1-10}}。\n" +
+				"- 不允许输出无结构自然语言作为最终结果。",
+		},
 		currentUser,
 	)
 
-	response, toolCalls, err := e.llmClient.ChatWithTools(messages, tools, "auto", 0, 0)
-	if err != nil {
-		log.Printf("LLM decision failed: %v, using fallback", err)
-		return e.fallbackDecision(state), nil
+	for step := 1; step <= reactMaxSteps; step++ {
+		response, toolCalls, err := e.llmClient.ChatWithTools(messages, tools, "auto", 0, 0)
+		if err != nil {
+			log.Printf("LLM decision failed at step %d: %v, using fallback", step, err)
+			return e.fallbackDecision(state), nil
+		}
+
+		// 终止条件 1：无工具调用，且返回 final envelope
+		if len(toolCalls) == 0 {
+			if env, ok := parseReActEnvelope(response); ok && env.Type == "final" && env.Final != nil {
+				e.appendDecisionHistory(currentUser, llm.Message{Role: "assistant", Content: response})
+				return env.Final, nil
+			}
+
+			// 无工具调用但不是 final：强制协议修正
+			messages = append(messages,
+				llm.Message{Role: "assistant", Content: response},
+				llm.Message{Role: "user", Content: "协议错误：你未发起 tool_calls 且未返回 final。请仅返回 {\"type\":\"final\",\"final\":...}。"},
+			)
+			continue
+		}
+
+		// 终止条件 2：有工具调用，执行后以结构化 tool_result 回填，进入下一步
+		toolResults := e.executeToolCallsAndCollect(ctx, toolCalls)
+		resultPayload, _ := json.Marshal(map[string]interface{}{
+			"type":        "tool_result",
+			"step":        step,
+			"tool_results": toolResults,
+		})
+		messages = append(messages,
+			llm.Message{Role: "assistant", Content: response},
+			llm.Message{Role: "user", Content: string(resultPayload)},
+		)
 	}
 
-	// 如果 LLM 在决策阶段触发了工具调用，这里立即执行对应的技能。
-	if len(toolCalls) > 0 {
-		log.Printf("LLM suggested %d tool calls in decision stage", len(toolCalls))
-		e.executeToolCalls(ctx, toolCalls)
-	}
-
-	// 解析 JSON 响应
-	plan := &ActionPlan{}
-	if err := e.parseActionPlan(response, plan); err != nil {
-		log.Printf("Failed to parse LLM response: %v, using fallback", err)
-		return e.fallbackDecision(state), nil
-	}
-
-	// 将本轮 user/assistant 对话追加进历史，供下一次决策时带上上下文。
-	e.appendDecisionHistory(currentUser, llm.Message{Role: "assistant", Content: response})
-
-	return plan, nil
+	// 终止条件 3：达到最大步数，仍未得到可用计划，回退
+	log.Printf("ReAct reached max steps (%d), using fallback", reactMaxSteps)
+	return e.fallbackDecision(state), nil
 }
 
 // appendDecisionHistory 维护一个有限长度的决策对话历史，避免无限增长。
@@ -257,24 +308,92 @@ func (e *AutonomousEvolutionEngine) parseActionPlan(response string, plan *Actio
 
 // fallbackDecision 回退决策（LLM 不可用时）
 func (e *AutonomousEvolutionEngine) fallbackDecision(state *SystemState) *ActionPlan {
+	policy := e.getFallbackPolicy()
+
+	// 1) 记忆膨胀优先处理
 	if state.MemoryState.NeedsSummarize {
 		return &ActionPlan{
 			Action:         "summarize",
-			Reason:         state.MemoryState.SummarizeReason,
+			Reason:         nonEmpty(state.MemoryState.SummarizeReason, "memory summarize trigger matched"),
 			Steps:          []string{"选择需要压缩的文件", "生成摘要", "移动到 backup"},
 			ExpectedOutcome: "archive 文件数减少",
 			Priority:       8,
 		}
 	}
 
-	// 默认：idle
+	// 2) 近期任务成功率过低，优先反思与修复
+	if len(state.TaskState.RecentTasks) >= policy.minRecentTasks &&
+		state.TaskState.SuccessRate > 0 &&
+		state.TaskState.SuccessRate < policy.lowSuccessRate {
+		return &ActionPlan{
+			Action:          "reflect",
+			Reason:          fmt.Sprintf("recent task success rate is low: %.2f", state.TaskState.SuccessRate),
+			Steps:           []string{"分析最近失败任务", "提炼失败模式", "形成改进方案"},
+			ExpectedOutcome: "提升后续任务成功率",
+			Priority:        7,
+		}
+	}
+
+	// 3) 没有能力记录时，优先学习
+	if len(state.EvolutionState.Capabilities) == 0 {
+		return &ActionPlan{
+			Action:          "learn",
+			Reason:          "capabilities are empty; bootstrap learning is required",
+			Steps:           []string{"整理当前状态", "生成学习更新计划", "写入记忆"},
+			ExpectedOutcome: "建立初始能力与学习轨迹",
+			Priority:        6,
+		}
+	}
+
+	// 4) 有待处理队列时降级为 idle，避免进一步堆积
+	if state.TaskState.PendingTasks >= policy.pendingTasksThreshold {
+		return &ActionPlan{
+			Action:          "idle",
+			Reason:          fmt.Sprintf("pending tasks exist: %d", state.TaskState.PendingTasks),
+			Steps:           []string{"等待队列任务消化"},
+			ExpectedOutcome: "避免任务拥塞",
+			Priority:        2,
+		}
+	}
+
+	// 默认：idle（健康态保守策略）
 	return &ActionPlan{
 		Action:         "idle",
-		Reason:         "当前状态良好，无需立即行动",
+		Reason:         "system state is healthy",
 		Steps:          []string{},
 		ExpectedOutcome: "保持当前状态",
 		Priority:       1,
 	}
+}
+
+func (e *AutonomousEvolutionEngine) getFallbackPolicy() fallbackPolicy {
+	policy := fallbackPolicy{
+		lowSuccessRate:        defaultFallbackLowSuccessRate,
+		minRecentTasks:        defaultFallbackMinRecentTasks,
+		pendingTasksThreshold: defaultFallbackPendingTasksThreshold,
+	}
+	if config.Config == nil {
+		return policy
+	}
+
+	cfg := config.Config.Evolution
+	if cfg.FallbackLowSuccessRate > 0 && cfg.FallbackLowSuccessRate < 1 {
+		policy.lowSuccessRate = cfg.FallbackLowSuccessRate
+	}
+	if cfg.FallbackMinRecentTasks > 0 {
+		policy.minRecentTasks = cfg.FallbackMinRecentTasks
+	}
+	if cfg.FallbackPendingTasksThreshold > 0 {
+		policy.pendingTasksThreshold = cfg.FallbackPendingTasksThreshold
+	}
+	return policy
+}
+
+func nonEmpty(value, fallback string) string {
+	if strings.TrimSpace(value) != "" {
+		return value
+	}
+	return fallback
 }
 
 // recordDecision 记录决策到记忆
@@ -498,16 +617,36 @@ func (e *AutonomousEvolutionEngine) buildDecisionTools() []llm.Tool {
 // 当前约定：由 buildDecisionTools 暴露的函数名形如 "skill_<技能名>"，
 // 这里会解析出技能名，并通过 SkillRegistry 找到并调用对应的 Skill.Run。
 // arguments JSON 中如包含 "args": ["--flag", "value"]，则作为 Run 的参数传入。
-func (e *AutonomousEvolutionEngine) executeToolCalls(ctx context.Context, toolCalls []llm.ToolCall) {
-	if e.registry == nil || len(toolCalls) == 0 {
-		return
+func (e *AutonomousEvolutionEngine) executeToolCallsAndCollect(ctx context.Context, toolCalls []llm.ToolCall) []reactToolResult {
+	if len(toolCalls) == 0 {
+		return []reactToolResult{{
+			ToolCallID: "none",
+			ToolName:   "none",
+			Success:    true,
+			Observation: "no tool calls",
+		}}
+	}
+	if e.registry == nil {
+		return []reactToolResult{{
+			ToolCallID: "registry",
+			ToolName:   "registry",
+			Success:    false,
+			Observation: "tool calls requested, but skill registry is unavailable in current runtime",
+		}}
 	}
 
+	var observations []reactToolResult
 	for _, tc := range toolCalls {
 		fn := tc.Function
 		name := fn.Name
 		if !strings.HasPrefix(name, "skill_") {
 			log.Printf("Skipping tool call %s: unsupported function name=%s", tc.ID, name)
+			observations = append(observations, reactToolResult{
+				ToolCallID: tc.ID,
+				ToolName:   name,
+				Success:    false,
+				Observation: "unsupported function",
+			})
 			continue
 		}
 
@@ -515,6 +654,12 @@ func (e *AutonomousEvolutionEngine) executeToolCalls(ctx context.Context, toolCa
 		skill, ok := e.registry.Get(skillName)
 		if !ok {
 			log.Printf("Skill %s not found for tool call %s", skillName, tc.ID)
+			observations = append(observations, reactToolResult{
+				ToolCallID: tc.ID,
+				ToolName:   skillName,
+				Success:    false,
+				Observation: "skill not found",
+			})
 			continue
 		}
 
@@ -523,6 +668,12 @@ func (e *AutonomousEvolutionEngine) executeToolCalls(ctx context.Context, toolCa
 			var raw map[string]interface{}
 			if err := json.Unmarshal([]byte(fn.Arguments), &raw); err != nil {
 				log.Printf("Failed to parse arguments for tool call %s (skill=%s): %v", tc.ID, skillName, err)
+				observations = append(observations, reactToolResult{
+					ToolCallID: tc.ID,
+					ToolName:   skillName,
+					Success:    false,
+					Observation: fmt.Sprintf("parse args failed: %v", err),
+				})
 			} else if v, ok := raw["args"]; ok {
 				if arr, ok := v.([]interface{}); ok {
 					for _, item := range arr {
@@ -537,6 +688,46 @@ func (e *AutonomousEvolutionEngine) executeToolCalls(ctx context.Context, toolCa
 		log.Printf("Executing skill tool call: id=%s, skill=%s, args=%v", tc.ID, skillName, args)
 		if err := skill.Run(ctx, args); err != nil {
 			log.Printf("Skill %s execution failed for tool call %s: %v", skillName, tc.ID, err)
+			observations = append(observations, reactToolResult{
+				ToolCallID: tc.ID,
+				ToolName:   skillName,
+				Success:    false,
+				Observation: err.Error(),
+			})
+			continue
 		}
+		observations = append(observations, reactToolResult{
+			ToolCallID: tc.ID,
+			ToolName:   skillName,
+			Success:    true,
+			Observation: "ok",
+		})
 	}
+
+	if len(observations) == 0 {
+		return []reactToolResult{{
+			ToolCallID: "unknown",
+			ToolName:   "unknown",
+			Success:    false,
+			Observation: "tool calls executed with no observations",
+		}}
+	}
+	return observations
+}
+
+func parseReActEnvelope(response string) (*reactAssistantEnvelope, bool) {
+	jsonStart := strings.Index(response, "{")
+	jsonEnd := strings.LastIndex(response, "}")
+	if jsonStart < 0 || jsonEnd <= jsonStart {
+		return nil, false
+	}
+	raw := response[jsonStart : jsonEnd+1]
+	var env reactAssistantEnvelope
+	if err := json.Unmarshal([]byte(raw), &env); err != nil {
+		return nil, false
+	}
+	if strings.TrimSpace(env.Type) == "" {
+		return nil, false
+	}
+	return &env, true
 }

@@ -53,3 +53,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Contact
 For any inquiries, please reach out to [your-email@example.com](mailto:your-email@example.com).
+
+
+场景,推荐方案,理由
+极致安全（如处理未知来源代码）,Wasm,它是软件定义的沙盒，完全不依赖内核隔离，几乎无法逃逸。
+本地高性能执行（AI 自动调优）,Bubblewrap,极低开销，直接利用内核特性，比 Docker 更轻快。
+快速开发/兼容性强,Docker,"生态位最全，Python 各种库（numpy, pandas）安装最方便。"

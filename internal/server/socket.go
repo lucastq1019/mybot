@@ -8,17 +8,30 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 
-	"mybot/internal/brain"
 	"mybot/internal/config"
 	"mybot/internal/evolution"
-	"mybot/internal/llm"
 	"mybot/internal/memory"
 )
 
 const (
 	DefaultSocketPath = ".cata/cata.sock"
+
+	cmdRecall      = "recall"
+	cmdDigest      = "digest"
+	cmdConsolidate = "consolidate"
+	cmdEvolve      = "evolve"
+	cmdTask        = "task"
+	cmdPing        = "ping"
+
+	msgPong                 = "pong"
+	msgUnknownCommandPrefix = "unknown command: "
+
+	usageRecall      = "usage: recall <query> [topK] [--llm]"
+	usageConsolidate = "usage: consolidate <topic> <content>"
+	usageTask        = "usage: task <create|list|status> [args]"
 )
 
 // SocketServer 处理客户端连接
@@ -144,30 +157,22 @@ func (ss *SocketServer) handleConnection(conn net.Conn) {
 // handleCommand 处理命令
 func (ss *SocketServer) handleCommand(req Request) Response {
 	switch req.Command {
-	case "recall":
+	case cmdRecall:
 		return ss.handleRecall(req.Args)
-	case "digest":
+	case cmdDigest:
 		return ss.handleDigest(req.Args)
-	case "consolidate":
+	case cmdConsolidate:
 		return ss.handleConsolidate(req.Args)
-	case "skill_list":
-		return ss.handleSkillList()
-	case "skill_get":
-		return ss.handleSkillGet(req.Args)
-	case "skill_enable":
-		return ss.handleSkillEnable(req.Args)
-	case "skill_disable":
-		return ss.handleSkillDisable(req.Args)
-	case "ping":
-		return Response{Success: true, Message: "pong"}
-	case "evolve":
+	case cmdEvolve:
 		return ss.handleEvolve(req.Args)
-	case "task":
+	case cmdTask:
 		return ss.handleTask(req.Args)
+	case cmdPing:
+		return Response{Success: true, Message: msgPong}
 	default:
 		return Response{
 			Success: false,
-			Message: fmt.Sprintf("Unknown command: %s", req.Command),
+			Message: msgUnknownCommandPrefix + req.Command,
 		}
 	}
 }
@@ -177,23 +182,20 @@ func (ss *SocketServer) handleRecall(args []string) Response {
 	if len(args) < 1 {
 		return Response{
 			Success: false,
-			Message: "Usage: recall <query> [topK] [--llm]",
+			Message: usageRecall,
 		}
 	}
 
 	query := args[0]
 	topK := 5
 	useLLM := false
-	
+
 	// 解析参数
 	for i := 1; i < len(args); i++ {
 		if args[i] == "--llm" {
 			useLLM = true
-		} else if topK == 5 {
-			// 尝试解析为 topK
-			if _, err := fmt.Sscanf(args[i], "%d", &topK); err != nil {
-				topK = 5
-			}
+		} else if parsed, err := strconv.Atoi(args[i]); err == nil {
+			topK = parsed
 		}
 	}
 
@@ -218,7 +220,7 @@ func (ss *SocketServer) handleDigest(args []string) Response {
 	// 解析参数：--since 7d, --week, --month 等
 	query := ""
 	timeRange := "7d" // 默认 7 天
-	
+
 	for i, arg := range args {
 		if arg == "--since" && i+1 < len(args) {
 			timeRange = args[i+1]
@@ -230,11 +232,11 @@ func (ss *SocketServer) handleDigest(args []string) Response {
 			query = arg
 		}
 	}
-	
+
 	if query == "" {
 		query = "all" // 默认查询所有
 	}
-	
+
 	// 根据时间范围 Recall（使用 LLM 预处理）
 	results, err := ss.server.memMgr.RecallWithPreprocess(query, 20, true)
 	if err != nil {
@@ -243,36 +245,18 @@ func (ss *SocketServer) handleDigest(args []string) Response {
 			Message: fmt.Sprintf("Recall failed: %v", err),
 		}
 	}
-	
+
 	// 格式化结果
 	summary := memory.FormatMemoryPiecesForSummary(results)
-	
-	// 调用 LLM 生成摘要（如果有 LLM 集成）
-	var llmSummary string
-	if config.Config != nil && config.Config.LLM.Enabled || llm.IsAvailable() {
-		// 使用按角色配置的摘要模型
-		llmClient, err := llm.NewClientForRole(llm.RoleSummarize)
-		if err == nil {
-			instructions := fmt.Sprintf(
-				"你是一个专业的记忆摘要助手。请为以下内容生成一个简洁、结构化的摘要。" +
-				"摘要应该保留关键信息、重要事件和决策，使用 Markdown 格式。",
-			)
-			llmSummary, err = llmClient.Summarize(summary, instructions)
-			if err != nil {
-				llmSummary = fmt.Sprintf("LLM summary generation failed: %v", err)
-			}
-		}
-	}
-	
+
 	return Response{
 		Success: true,
 		Message: fmt.Sprintf("Digest for %s (time range: %s)", query, timeRange),
 		Data: map[string]interface{}{
-			"query":      query,
+			"query":     query,
 			"time_range": timeRange,
-			"summary":    summary,
-			"llm_summary": llmSummary,
-			"count":      len(results),
+			"summary":   summary,
+			"count":     len(results),
 		},
 	}
 }
@@ -282,7 +266,7 @@ func (ss *SocketServer) handleConsolidate(args []string) Response {
 	if len(args) < 2 {
 		return Response{
 			Success: false,
-			Message: "Usage: consolidate <topic> <content>",
+			Message: usageConsolidate,
 		}
 	}
 
@@ -302,106 +286,12 @@ func (ss *SocketServer) handleConsolidate(args []string) Response {
 	}
 }
 
-// handleSkillList 处理 skill list 命令，合并注册表与 brain/core.md skills-index，便于与技能调用规则一致。
-func (ss *SocketServer) handleSkillList() Response {
-	registry := ss.server.registry
-	config := registry.GetConfig()
-	registered := registry.List()
-
-	// 已注册技能名 -> 详情（含 cron、cli_command）
-	byName := make(map[string]map[string]interface{})
-	for _, skill := range registered {
-		enabled := config.IsSkillEnabled(skill.Name())
-		byName[skill.Name()] = map[string]interface{}{
-			"name":         skill.Name(),
-			"enabled":      enabled,
-			"cron":         skill.CronSchedule(),
-			"cli_command":  skill.CLICommand(),
-			"implemented":  true,
-		}
-	}
-
-	// 用 skills-index 补全 description、tags，并标出仅存在于索引的技能
-	if idx, err := ss.server.GetSkillsIndexLoader().Get(); err == nil && idx != nil {
-		for _, meta := range idx.Skills {
-			if info, ok := byName[meta.Name]; ok {
-				info["description"] = meta.Description
-				info["tags"] = meta.Tags
-				info["dependencies"] = meta.Dependencies
-			} else {
-				byName[meta.Name] = map[string]interface{}{
-					"name":         meta.Name,
-					"description":  meta.Description,
-					"tags":         meta.Tags,
-					"dependencies": meta.Dependencies,
-					"implemented":  false,
-				}
-			}
-		}
-	}
-
-	skillInfo := make([]map[string]interface{}, 0, len(byName))
-	for _, info := range byName {
-		skillInfo = append(skillInfo, info)
-	}
-
-	return Response{
-		Success: true,
-		Message: fmt.Sprintf("Found %d skills (registry + brain skills-index)", len(skillInfo)),
-		Data:    skillInfo,
-	}
-}
-
-// handleSkillGet 返回指定技能的 SKILL.md 全文，供 Agent（Cursor/LLM）按 core.md 规则执行 MD 技能。
-// 与 brain 对齐：技能索引与路径来自 skills-index.json，MD 技能由 Agent 读入并执行，server 仅提供内容。
-func (ss *SocketServer) handleSkillGet(args []string) Response {
-	if len(args) < 1 {
-		return Response{
-			Success: false,
-			Message: "Usage: skill_get <skill-name>",
-		}
-	}
-	skillName := args[0]
-	meta, err := ss.server.GetSkillsIndexLoader().SkillByName(skillName)
-	if err != nil || meta == nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Skill not found in skills-index: %s", skillName),
-		}
-	}
-	absPath := filepath.Join(brain.BaseDir(), meta.Path)
-	content, err := os.ReadFile(absPath)
-	if err != nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to read SKILL.md: %v", err),
-		}
-	}
-	return Response{
-		Success: true,
-		Message: fmt.Sprintf("Skill: %s", skillName),
-		Data: map[string]interface{}{
-			"name":        meta.Name,
-			"path":        meta.Path,
-			"description": meta.Description,
-			"tags":        meta.Tags,
-			"content":     string(content),
-		},
-	}
-}
-
-// handleEvolve 处理 evolve 命令
 func (ss *SocketServer) handleEvolve(args []string) Response {
 	if len(args) == 0 {
-		return Response{
-			Success: false,
-			Message: "Usage: evolve <subcommand> [args]",
-		}
+		return Response{Success: false, Message: "usage: evolve <status|history|once>"}
 	}
 
-	subcommand := args[0]
-
-	switch subcommand {
+	switch args[0] {
 	case "status":
 		return ss.handleEvolveStatus()
 	case "history":
@@ -409,35 +299,24 @@ func (ss *SocketServer) handleEvolve(args []string) Response {
 	case "once":
 		return ss.handleEvolveOnce()
 	default:
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Unknown evolve subcommand: %s", subcommand),
-		}
+		return Response{Success: false, Message: "unknown evolve subcommand: " + args[0]}
 	}
 }
 
-// handleEvolveStatus 处理 evolve status 命令
 func (ss *SocketServer) handleEvolveStatus() Response {
 	if ss.server.evolution == nil {
-		return Response{
-			Success: false,
-			Message: "Evolution engine not available",
-		}
+		return Response{Success: false, Message: "evolution engine not available"}
 	}
 
-	// 获取状态分析器
 	analyzer := evolution.NewStateAnalyzer(ss.server.memMgr)
 	state, err := analyzer.Analyze()
 	if err != nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to analyze state: %v", err),
-		}
+		return Response{Success: false, Message: fmt.Sprintf("failed to analyze state: %v", err)}
 	}
 
 	return Response{
 		Success: true,
-		Message: "Evolution status",
+		Message: "evolution status",
 		Data: map[string]interface{}{
 			"memory_state": map[string]interface{}{
 				"archive_file_count": state.MemoryState.ArchiveFileCount,
@@ -459,107 +338,68 @@ func (ss *SocketServer) handleEvolveStatus() Response {
 	}
 }
 
-// handleEvolveHistory 处理 evolve history 命令
 func (ss *SocketServer) handleEvolveHistory() Response {
-	// 读取 evolution_log.json
-	logFile := evolution.EvolutionLogFilePath
-	data, err := os.ReadFile(logFile)
+	data, err := os.ReadFile(evolution.EvolutionLogFilePath)
 	if err != nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to read evolution log: %v", err),
-		}
+		return Response{Success: false, Message: fmt.Sprintf("failed to read evolution log: %v", err)}
 	}
 
-	var log evolution.EvolutionLog
-	if err := json.Unmarshal(data, &log); err != nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to parse evolution log: %v", err),
-		}
+	var logData evolution.EvolutionLog
+	if err := json.Unmarshal(data, &logData); err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("failed to parse evolution log: %v", err)}
 	}
 
-	// 返回最近 20 条记录
-	start := len(log.Entries) - 20
+	start := len(logData.Entries) - 20
 	if start < 0 {
 		start = 0
 	}
-
 	return Response{
 		Success: true,
-		Message: fmt.Sprintf("Found %d evolution entries", len(log.Entries)),
-		Data:    log.Entries[start:],
+		Message: fmt.Sprintf("found %d evolution entries", len(logData.Entries)),
+		Data:    logData.Entries[start:],
 	}
 }
 
-// handleEvolveOnce 处理 evolve once 命令（手动触发一次演进循环）
 func (ss *SocketServer) handleEvolveOnce() Response {
 	if ss.server.evolution == nil {
-		return Response{
-			Success: false,
-			Message: "Evolution engine not available",
-		}
+		return Response{Success: false, Message: "evolution engine not available"}
 	}
 
-	// 在后台执行一次演进循环
 	go func() {
 		if err := ss.server.evolution.ExecuteAutonomousCycle(ss.server.ctx); err != nil {
 			log.Printf("Error executing evolution cycle: %v", err)
 		}
 	}()
 
-	return Response{
-		Success: true,
-		Message: "Evolution cycle triggered, check status later",
-	}
+	return Response{Success: true, Message: "evolution cycle triggered"}
 }
 
-// handleTask 处理 task 命令
 func (ss *SocketServer) handleTask(args []string) Response {
 	if len(args) == 0 {
-		return Response{
-			Success: false,
-			Message: "Usage: task <create|list|status> [args]",
-		}
+		return Response{Success: false, Message: usageTask}
 	}
 
-	subcommand := args[0]
-
-	switch subcommand {
+	switch args[0] {
 	case "create":
 		return ss.handleTaskCreate(args[1:])
 	case "list":
 		return ss.handleTaskList()
 	case "status":
 		if len(args) < 2 {
-			return Response{
-				Success: false,
-				Message: "Usage: task status <task-id>",
-			}
+			return Response{Success: false, Message: "usage: task status <task-id>"}
 		}
 		return ss.handleTaskStatus(args[1])
 	default:
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Unknown task subcommand: %s", subcommand),
-		}
+		return Response{Success: false, Message: "unknown task subcommand: " + args[0]}
 	}
 }
 
-// handleTaskCreate 处理 task create 命令
 func (ss *SocketServer) handleTaskCreate(args []string) Response {
 	if ss.server.evolution == nil {
-		return Response{
-			Success: false,
-			Message: "Evolution engine not available",
-		}
+		return Response{Success: false, Message: "evolution engine not available"}
 	}
-
 	if len(args) < 1 {
-		return Response{
-			Success: false,
-			Message: "Usage: task create <type> [steps...] [--async]\n       task create \"<你的需求描述（长串字符串）>\" [--async]\nTypes: summarize, consolidate, recall, learn, optimize, reflect, idle, integrate, custom\n直接传入一句需求时自动按 custom 执行，由 cata 解析并执行",
-		}
+		return Response{Success: false, Message: "usage: task create <type|description> [steps...] [--async]"}
 	}
 
 	knownTypes := map[string]bool{
@@ -567,7 +407,6 @@ func (ss *SocketServer) handleTaskCreate(args []string) Response {
 		"optimize": true, "reflect": true, "idle": true, "integrate": true,
 	}
 
-	// 解析 --async，剩余部分为 type + steps 或仅需求字符串
 	rest := []string{}
 	async := false
 	for i := 0; i < len(args); i++ {
@@ -578,30 +417,22 @@ func (ss *SocketServer) handleTaskCreate(args []string) Response {
 		}
 	}
 
-	var taskType string
-	var steps []string
+	taskType := "custom"
+	steps := []string{}
 	if len(rest) >= 1 && knownTypes[rest[0]] {
 		taskType = rest[0]
 		steps = rest[1:]
-		// 构建 ActionPlan
 	} else if len(rest) >= 1 {
-		// 首参数不是已知类型：整段视为用户需求（custom）
-		taskType = "custom"
 		steps = []string{strings.Join(rest, " ")}
 	} else {
-		return Response{
-			Success: false,
-			Message: "Usage: task create \"<需求描述>\" or task create <type> [steps...]",
-		}
+		return Response{Success: false, Message: "usage: task create <type|description> [steps...] [--async]"}
 	}
 
 	reason := fmt.Sprintf("Task created via catacli: %s", taskType)
 	if taskType == "custom" && len(steps) > 0 {
 		reason = steps[0]
-		if len(reason) > 200 {
-			reason = reason[:200] + "..."
-		}
 	}
+
 	actionPlan := &evolution.ActionPlan{
 		Action:          taskType,
 		Reason:          reason,
@@ -611,139 +442,56 @@ func (ss *SocketServer) handleTaskCreate(args []string) Response {
 	}
 
 	if async {
-		// 异步执行：加入队列
 		queuedTask, err := ss.server.evolution.EnqueueTask(actionPlan, "user")
 		if err != nil {
-			return Response{
-				Success: false,
-				Message: fmt.Sprintf("Failed to enqueue task: %v", err),
-			}
+			return Response{Success: false, Message: fmt.Sprintf("failed to enqueue task: %v", err)}
 		}
-
 		return Response{
 			Success: true,
-			Message: fmt.Sprintf("Task queued successfully: %s", queuedTask.ID),
-			Data: map[string]interface{}{
-				"task_id":   queuedTask.ID,
-				"type":      queuedTask.Type,
-				"status":    queuedTask.Status,
-				"created_at": queuedTask.CreatedAt,
-				"message":   "Task will be executed by cata automatically",
-			},
+			Message: fmt.Sprintf("task queued: %s", queuedTask.ID),
+			Data:    queuedTask,
 		}
-	} else {
-		// 同步执行：立即执行并返回结果
-		result, err := ss.server.evolution.ExecuteTask(ss.server.ctx, actionPlan)
-		if err != nil {
-			return Response{
-				Success: false,
-				Message: fmt.Sprintf("Task execution failed: %v", err),
-			}
-		}
+	}
 
-		return Response{
-			Success: true,
-			Message: fmt.Sprintf("Task executed successfully: %s", result.Output),
-			Data: map[string]interface{}{
-				"task_id":  actionPlan.Action,
-				"output":   result.Output,
-				"learning": result.Learning,
-				"success":  result.Success,
-			},
-		}
+	result, err := ss.server.evolution.ExecuteTask(ss.server.ctx, actionPlan)
+	if err != nil {
+		return Response{Success: false, Message: fmt.Sprintf("task execution failed: %v", err)}
+	}
+	return Response{
+		Success: true,
+		Message: "task executed",
+		Data: map[string]interface{}{
+			"task_type": taskType,
+			"output":    result.Output,
+			"learning":  result.Learning,
+			"success":   result.Success,
+		},
 	}
 }
 
-// handleTaskList 处理 task list 命令
 func (ss *SocketServer) handleTaskList() Response {
 	if ss.server.evolution == nil {
-		return Response{
-			Success: false,
-			Message: "Evolution engine not available",
-		}
+		return Response{Success: false, Message: "evolution engine not available"}
 	}
-
-	// 从任务队列获取任务列表
 	queue := ss.server.evolution.GetTaskQueue()
-	tasks := queue.ListTasks("", 50) // 获取最近 50 条任务
-
+	tasks := queue.ListTasks("", 50)
 	return Response{
 		Success: true,
-		Message: fmt.Sprintf("Found %d tasks", len(tasks)),
+		Message: fmt.Sprintf("found %d tasks", len(tasks)),
 		Data:    tasks,
 	}
 }
 
-// handleTaskStatus 处理 task status 命令
 func (ss *SocketServer) handleTaskStatus(taskID string) Response {
 	if ss.server.evolution == nil {
-		return Response{
-			Success: false,
-			Message: "Evolution engine not available",
-		}
+		return Response{Success: false, Message: "evolution engine not available"}
 	}
-
-	// 从任务队列查找任务
 	queue := ss.server.evolution.GetTaskQueue()
 	task := queue.GetTask(taskID)
-	if task != nil {
-		return Response{
-			Success: true,
-			Message: "Task found",
-			Data:    task,
-		}
+	if task == nil {
+		return Response{Success: false, Message: "task not found: " + taskID}
 	}
-
-	return Response{
-		Success: false,
-		Message: fmt.Sprintf("Task not found: %s", taskID),
-	}
-}
-
-// handleSkillEnable 处理 skill enable 命令
-func (ss *SocketServer) handleSkillEnable(args []string) Response {
-	if len(args) < 1 {
-		return Response{
-			Success: false,
-			Message: "Usage: skill_enable <skill-name>",
-		}
-	}
-
-	skillName := args[0]
-	if err := ss.server.registry.EnableSkill(skillName); err != nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to enable skill: %v", err),
-		}
-	}
-
-	return Response{
-		Success: true,
-		Message: fmt.Sprintf("Skill '%s' enabled", skillName),
-	}
-}
-
-// handleSkillDisable 处理 skill disable 命令
-func (ss *SocketServer) handleSkillDisable(args []string) Response {
-	if len(args) < 1 {
-		return Response{
-			Success: false,
-			Message: "Usage: skill_disable <skill-name>",
-		}
-	}
-
-	skillName := args[0]
-	if err := ss.server.registry.DisableSkill(skillName); err != nil {
-		return Response{
-			Success: false,
-			Message: fmt.Sprintf("Failed to disable skill: %v", err),
-		}
-	}
-
-	return Response{
-		Success: true,
-		Message: fmt.Sprintf("Skill '%s' disabled", skillName),
-	}
+	return Response{Success: true, Message: "task found", Data: task}
 }
 
 // sendResponse 发送响应

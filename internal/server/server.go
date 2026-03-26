@@ -9,23 +9,26 @@ import (
 	"syscall"
 	"time"
 
-	"mybot/internal/brain"
 	"mybot/internal/evolution"
 	"mybot/internal/memory"
 	"mybot/internal/scheduler"
 )
 
-// Server 常驻进程服务器。路径与技能索引与 brain/core.md 一致（见 internal/brain/paths.go）。
-// 可执行技能为 .so 插件与内置技能；MD 技能通过 socket 的 skill_get 提供 SKILL.md 内容，由 Agent 按 core 规则执行，避免 brain 与代码分歧导致无效演进。
+const (
+	logServerStart = "Starting Cata server..."
+	logServerReady = "Cata server started successfully!"
+)
+
+// Server 常驻进程服务器（精简版）。
+// 仅保留核心流程依赖：MemoryManager + Socket 命令交互。
 type Server struct {
-	memMgr       *memory.MemoryManager
-	sched        *scheduler.Scheduler
-	registry     *scheduler.SkillRegistry
-	skillsIndex  *scheduler.SkillsIndexLoader
-	socketSrv    *SocketServer
-	evolution    *evolution.AutonomousEvolutionEngine
-	ctx          context.Context
-	cancel       context.CancelFunc
+	memMgr    *memory.MemoryManager
+	socketSrv *SocketServer
+	evolution *evolution.AutonomousEvolutionEngine
+	registry  *scheduler.SkillRegistry
+	skillsIdx *scheduler.SkillsIndexLoader
+	ctx       context.Context
+	cancel    context.CancelFunc
 }
 
 // NewServer 创建新的服务器实例
@@ -36,71 +39,41 @@ func NewServer() (*Server, error) {
 		return nil, fmt.Errorf("failed to create MemoryManager: %w", err)
 	}
 
-	// 创建技能注册表
 	registry, err := scheduler.NewSkillRegistry()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create skill registry: %w", err)
 	}
 
-	// 创建调度器
-	sched := scheduler.NewScheduler(registry)
-
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &Server{
-		memMgr:      memMgr,
-		sched:       sched,
-		registry:    registry,
-		skillsIndex: scheduler.NewSkillsIndexLoader(),
-		ctx:         ctx,
-		cancel:      cancel,
+		memMgr: memMgr,
+		registry: registry,
+		skillsIdx: scheduler.NewSkillsIndexLoader(),
+		ctx:    ctx,
+		cancel: cancel,
 	}, nil
 }
 
-// Start 启动服务器（启动流程完整链路）
+// Start 启动服务器（核心链路：memory + evolution + socket）
 func (s *Server) Start() error {
-	log.Println("Starting Cata server...")
+	log.Println(logServerStart)
 
 	// 1. MemoryManager 已在 NewServer 中创建并加载索引
 	log.Println("✓ MemoryManager initialized")
 
-	// 2. 加载 Skills（路径与 brain/core.md 技能目录、技能索引一致）
-	skillsDir := brain.SkillsDir()
-	loader := scheduler.NewSkillLoader(skillsDir, s.registry)
-	if err := loader.LoadSkills(); err != nil {
-		log.Printf("Warning: failed to load skills: %v", err)
+	// 2. 接回最小可用 tool registry（不启用 scheduler，仅供 evolution 的 ReAct 工具调用）
+	if err := s.loadMinimalToolRegistry(); err != nil {
+		log.Printf("Warning: failed to load minimal tool registry: %v", err)
+	} else {
+		log.Printf("✓ Tool registry initialized (%d skills)", len(s.registry.List()))
 	}
-
-	// 加载 skills-index.json，与 core.md「从 skills-index 解析」对齐
-	if _, err := s.skillsIndex.Load(); err != nil {
+	if _, err := s.skillsIdx.Load(); err != nil {
 		log.Printf("Warning: failed to load skills index: %v", err)
 	}
 
-	// 注册内置技能（对应 workflow 定时/阈值任务：consolidate、summarize）
-	if err := s.loadBuiltinSkills(); err != nil {
-		log.Printf("Warning: failed to load builtin skills: %v", err)
-	}
-
-	skillCount := len(s.registry.List())
-	log.Printf("✓ Skills loaded (%d skills)", skillCount)
-
-	// 3. 注册定时任务
-	if err := s.sched.Start(); err != nil {
-		return fmt.Errorf("failed to start scheduler: %w", err)
-	}
-	log.Println("✓ Scheduler started")
-
-	// 4. 启动 socket 服务器（用于客户端通信）
-	socketSrv, err := NewSocketServer(s)
-	if err != nil {
-		return fmt.Errorf("failed to create socket server: %w", err)
-	}
-	s.socketSrv = socketSrv
-	socketSrv.Start()
-	log.Println("✓ Socket server started")
-
-	// 5. 初始化并启动自主演进引擎
-	evolutionEngine, err := evolution.NewAutonomousEvolutionEngine(s.memMgr, s.registry, s.skillsIndex)
+	// 2. 启动自主演进引擎（保留核心）
+	evolutionEngine, err := evolution.NewAutonomousEvolutionEngine(s.memMgr, s.registry, s.skillsIdx)
 	if err != nil {
 		log.Printf("Warning: failed to create evolution engine: %v", err)
 	} else {
@@ -109,10 +82,19 @@ func (s *Server) Start() error {
 		log.Println("✓ Autonomous evolution engine started")
 	}
 
-	// 6. 设置信号处理（优雅退出）
+	// 3. 启动 socket 服务器（用于客户端通信）
+	socketSrv, err := NewSocketServer(s)
+	if err != nil {
+		return fmt.Errorf("failed to create socket server: %w", err)
+	}
+	s.socketSrv = socketSrv
+	socketSrv.Start()
+	log.Println("✓ Socket server started")
+
+	// 4. 设置信号处理（优雅退出）
 	s.setupSignalHandling()
 
-	log.Println("Cata server started successfully!")
+	log.Println(logServerReady)
 	return nil
 }
 
@@ -143,8 +125,6 @@ func (s *Server) Stop() {
 		s.socketSrv.Stop()
 	}
 
-	s.sched.Stop()
-
 	time.Sleep(100 * time.Millisecond)
 
 	log.Println("Server stopped gracefully")
@@ -161,39 +141,23 @@ func (s *Server) GetMemoryManager() *memory.MemoryManager {
 	return s.memMgr
 }
 
-// GetRegistry 获取技能注册表
-func (s *Server) GetRegistry() *scheduler.SkillRegistry {
-	return s.registry
-}
-
-// GetScheduler 获取调度器
-func (s *Server) GetScheduler() *scheduler.Scheduler {
-	return s.sched
-}
-
 // GetEvolutionEngine 获取自主演进引擎
 func (s *Server) GetEvolutionEngine() *evolution.AutonomousEvolutionEngine {
 	return s.evolution
 }
 
-// GetSkillsIndexLoader 获取技能索引加载器（与 brain/core.md skills-index 一致）
-func (s *Server) GetSkillsIndexLoader() *scheduler.SkillsIndexLoader {
-	return s.skillsIndex
-}
+// loadMinimalToolRegistry 注册 evolution 可调用的最小技能集合。
+// 仅用于 ReAct 工具能力，不启动 scheduler。
+func (s *Server) loadMinimalToolRegistry() error {
+	daily := scheduler.NewDailyConsolidateSkill(s.memMgr)
+	if err := s.registry.Register(daily); err != nil {
+		return fmt.Errorf("register daily-consolidate: %w", err)
+	}
 
-// loadBuiltinSkills 加载内置技能
-func (s *Server) loadBuiltinSkills() error {
-	// 注册今日固化技能
-	dailySkill := scheduler.NewDailyConsolidateSkill(s.memMgr)
-	if err := s.registry.Register(dailySkill); err != nil {
-		return fmt.Errorf("failed to register daily consolidate skill: %w", err)
+	periodic := scheduler.NewPeriodicSummarizeSkill(s.memMgr)
+	if err := s.registry.Register(periodic); err != nil {
+		return fmt.Errorf("register periodic-summarize: %w", err)
 	}
-	
-	// 注册周期摘要技能
-	summarizeSkill := scheduler.NewPeriodicSummarizeSkill(s.memMgr)
-	if err := s.registry.Register(summarizeSkill); err != nil {
-		return fmt.Errorf("failed to register periodic summarize skill: %w", err)
-	}
-	
 	return nil
 }
+
