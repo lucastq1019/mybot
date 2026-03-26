@@ -59,6 +59,22 @@ func NewServer() (*Server, error) {
 func (s *Server) Start() error {
 	log.Println(logServerStart)
 
+	if err := s.startCorePipeline(); err != nil {
+		s.shutdownPartialStart()
+		return err
+	}
+
+	// 6. 设置信号处理（优雅退出）
+	s.setupSignalHandling()
+
+	log.Println("Cata server started successfully!")
+	return nil
+}
+
+// startCorePipeline 运行服务启动的核心流程。
+// 该流程按「记忆 -> 技能 -> 调度 -> 通信 -> 演进」顺序启动，任何关键阶段失败都会中断启动。
+func (s *Server) startCorePipeline() error {
+
 	// 1. MemoryManager 已在 NewServer 中创建并加载索引
 	log.Println("✓ MemoryManager initialized")
 
@@ -96,6 +112,23 @@ func (s *Server) Start() error {
 
 	log.Println(logServerReady)
 	return nil
+}
+
+// shutdownPartialStart 在启动流程中途失败时清理已启动的组件，避免遗留后台任务。
+func (s *Server) shutdownPartialStart() {
+	if s.evolution != nil {
+		s.evolution.SetEnabled(false)
+		s.evolution = nil
+	}
+
+	if s.socketSrv != nil {
+		s.socketSrv.Stop()
+		s.socketSrv = nil
+	}
+
+	if s.sched != nil {
+		s.sched.Stop()
+	}
 }
 
 // setupSignalHandling 设置信号处理（SIGTERM, SIGINT）
